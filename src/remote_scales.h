@@ -10,6 +10,9 @@ class DiscoveredDevice {
 public:
   DiscoveredDevice(NimBLEAdvertisedDevice* device) :
   name(device->getName()), address(device->getAddress()), manufacturerData(device->getManufacturerData()), rssi(device->getRSSI()) {}
+  // For a report whose advert carries no name: listed under a name the caller saved.
+  DiscoveredDevice(NimBLEAdvertisedDevice* device, const std::string& nameOverride) :
+  name(nameOverride), address(device->getAddress()), manufacturerData(device->getManufacturerData()), rssi(device->getRSSI()) {}
   const std::string& getName() const { return name; }
   const NimBLEAddress& getAddress() const { return address; }
   const std::string& getManufacturerData() const { return manufacturerData; }
@@ -142,8 +145,25 @@ private:
   void cleanupDiscoveredScales();
   void onResult(NimBLEAdvertisedDevice* advertisedDevice) override;
 
+  // Reconnect mode. With a target set, the scan is passive with the controller allow list holding only the target;
+  // without one it is the active, unfiltered discovery scan. `reconnectScan` is the mode the running scan started in.
+  bool hasReconnectTarget = false;
+  bool reconnectScan = false;
+  bool startedWithTarget = false; // hasReconnectTarget when the running scan started
+  bool allowListed = false;
+  NimBLEAddress reconnectAddress;
+  std::string reconnectName;
+  void onReconnectResult(NimBLEAdvertisedDevice* advertisedDevice);
+  void leaveReconnectScan();
+
 public:
   std::vector<DiscoveredDevice> getDiscoveredScales() { return discoveredScales; }
+
+  // The address carries its type (public/random); the name is used for plugin matching when the target's advert has
+  // none. Takes effect at the next initializeAsyncScan(), which restarts a scan running in the other mode.
+  void setReconnectTarget(const NimBLEAddress& address, const std::string& name);
+  void clearReconnectTarget();
+  bool isReconnectScan() const { return isRunning && reconnectScan; }
 
   void initializeAsyncScan();
   void stopAsyncScan();

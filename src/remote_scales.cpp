@@ -94,9 +94,28 @@ std::string RemoteScales::byteArrayToHexString(const uint8_t* byteArray, size_t 
 // ------------------------   RemoteScales methods    ------------------------------
 // ---------------------------------------------------------------------------------------
 
+void RemoteScalesScanner::setReconnectTarget(const NimBLEAddress& address, const std::string& name) {
+  reconnectAddress = address;
+  reconnectName = name;
+  hasReconnectTarget = true;
+}
+
+void RemoteScalesScanner::clearReconnectTarget() { hasReconnectTarget = false; }
+
 void RemoteScalesScanner::initializeAsyncScan() {
-  if (isRunning) return;
+  if (isRunning) {
+    if (startedWithTarget == hasReconnectTarget) return;
+    stopAsyncScan(); // the other mode: restart
+  }
   cleanupDiscoveredScales();
+
+  // Reconnect mode needs the target on the allow list before the scan starts (the host refuses to change the list
+  // while scanning). If the list cannot be set, scan as discovery rather than not at all.
+  bool reconnect = hasReconnectTarget;
+  if (reconnect) {
+    allowListed = NimBLEDevice::whiteListAdd(reconnectAddress);
+    if (!allowListed) reconnect = false;
+  }
 
   // We set the second parameter to true to prevent the library from storing BLEAdvertisedDevice objects
   // for devices we're not interested in. This is important because the library will otherwise run out of
@@ -106,8 +125,13 @@ void RemoteScalesScanner::initializeAsyncScan() {
   NimBLEDevice::getScan()->setWindow(100);
   NimBLEDevice::getScan()->setMaxResults(0);
   NimBLEDevice::getScan()->setDuplicateFilter(false);
-  NimBLEDevice::getScan()->setActiveScan(true);
+  // Reconnect: passive, allow-list filtered. A passive scan sends no scan request, so it neither waits for a scan
+  // response nor is subject to the controller's scan backoff. Discovery: active, unfiltered.
+  NimBLEDevice::getScan()->setFilterPolicy(reconnect ? BLE_HCI_SCAN_FILT_USE_WL : BLE_HCI_SCAN_FILT_NO_WL);
+  NimBLEDevice::getScan()->setActiveScan(!reconnect);
   NimBLEDevice::getScan()->start(0, nullptr, false); // Set to 0 for continuous
+  reconnectScan = reconnect;
+  startedWithTarget = hasReconnectTarget;
   isRunning = true;
 }
 
@@ -117,6 +141,20 @@ void RemoteScalesScanner::stopAsyncScan() {
   NimBLEDevice::getScan()->clearResults();
   alreadySeenAddresses.cleanup();
   isRunning = false;
+  leaveReconnectScan();
+}
+
+// The NimBLEScan is shared with other users of the stack that never set the filter policy: leave it as found
+// (no allow list) and take the scanner's entry off the list.
+void RemoteScalesScanner::leaveReconnectScan() {
+  if (allowListed) {
+    NimBLEDevice::whiteListRemove(reconnectAddress);
+    allowListed = false;
+  }
+  if (reconnectScan) {
+    NimBLEDevice::getScan()->setFilterPolicy(BLE_HCI_SCAN_FILT_NO_WL);
+    reconnectScan = false;
+  }
 }
 
 void RemoteScalesScanner::restartAsyncScan() {
@@ -124,7 +162,22 @@ void RemoteScalesScanner::restartAsyncScan() {
   initializeAsyncScan();
 }
 
+// Reconnect mode: only the target is listed, once, under the name from its advert or else the saved one (a passive
+// scan sees no scan response, which is where many scales put their name).
+void RemoteScalesScanner::onReconnectResult(NimBLEAdvertisedDevice* advertisedDevice) {
+  if (advertisedDevice->getAddress() != reconnectAddress || !discoveredScales.empty()) return;
+  std::string name = advertisedDevice->getName();
+  DiscoveredDevice device(advertisedDevice, name.empty() ? reconnectName : name);
+  if (RemoteScalesPluginRegistry::getInstance()->containsPluginForDevice(device)) {
+    discoveredScales.push_back(device);
+  }
+}
+
 void RemoteScalesScanner::onResult(NimBLEAdvertisedDevice* advertisedDevice) {
+  if (reconnectScan) {
+    onReconnectResult(advertisedDevice);
+    return;
+  }
   // Only dedupe addresses that have already matched a plugin. A device whose
   // local name arrives in a separate scan-response packet (common: many
   // peripherals omit the name from the primary ADV_IND to save space) would
